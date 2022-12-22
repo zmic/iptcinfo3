@@ -65,7 +65,8 @@ def smart_open(path, *args, **kwargs):
     try:
         yield fh
     finally:
-        fh.close()
+        pass
+        #fh.close()
 
 
 def duck_typed(obj, prefs):
@@ -599,13 +600,14 @@ class IPTCInfo:
 
     error = None
 
-    def __init__(self, fobj, force=False, inp_charset=None, out_charset=None):
+    def __init__(self, fobj=None, force=False, inp_charset=None, out_charset=None):
         self._data = IPTCData({
             'supplemental category': [],
             'keywords': [],
             'contact': [],
         })
         self._fobj = fobj
+            
         if duck_typed(fobj, 'read'):  # DELETEME
             self._filename = None
         else:
@@ -614,7 +616,12 @@ class IPTCInfo:
         self.inp_charset = inp_charset
         self.out_charset = out_charset or inp_charset
 
+        if fobj == None:
+            self._filename = None
+            return
+
         with smart_open(self._fobj, 'rb') as fh:
+            fh = fobj
             datafound = self.scanToFirstIMMTag(fh)
             if datafound or force:
                 # Do the real snarfing here
@@ -634,14 +641,9 @@ class IPTCInfo:
         assert self._filename is not None
         return self.save_as(self._filename, options)
 
-    def save_as(self, newfile, options=None):
-        """Saves Jpeg with IPTC data to a given file name."""
-        with smart_open(self._fobj, 'rb') as fh:
-            if not file_is_jpeg(fh):
-                logger.error('Source file %s is not a Jpeg.' % self._fob)
-                return None
-
-            jpeg_parts = jpeg_collect_file_parts(fh)
+    def save_as(self, fh, newfile, options=None):
+        """Saves Jpeg with IPTC data to a given file name."""        
+        jpeg_parts = jpeg_collect_file_parts(fh)
 
         if jpeg_parts is None:
             raise Exception('jpeg_collect_file_parts failed: %s' % self.error)
@@ -655,12 +657,9 @@ class IPTCInfo:
             LOGDBG.debug('adobe2: %r', adobe)
 
         LOGDBG.info('writing...')
-        (tmpfd, tmpfn) = tempfile.mkstemp()
-        if self._filename and os.path.exists(self._filename):
-            shutil.copystat(self._filename, tmpfn)
-        tmpfh = os.fdopen(tmpfd, 'wb')
+        tmpfh = open(newfile, "wb")
         if not tmpfh:
-            logger.error("Can't open output file %r", tmpfn)
+            logger.error("Can't open output file %r", newfile)
             return None
 
         LOGDBG.debug('start=%d end=%d', len(start), len(end))
@@ -675,14 +674,18 @@ class IPTCInfo:
             tmpfh.write(pack("!BBBHH", 0x1c, 1, 90, 4, ch))
 
         LOGDBG.debug('pos: %d', self._filepos(tmpfh))
-        data = self.photoshopIIMBlock(adobe, self.packedIIMData())
-        LOGDBG.debug('data len=%d dmp=%s', len(data), hex_dump(data))
-        tmpfh.write(data)
-        LOGDBG.debug('pos: %d', self._filepos(tmpfh))
+        packed_data = self.packedIIMData()
+        while packed_data:
+            chunk, packed_data = packed_data[:0xff80], packed_data[0xff80:]
+            data = self.photoshopIIMBlock(adobe, chunk)
+            #LOGDBG.debug('data len=%d dmp=%s', len(data), hex_dump(data))
+            tmpfh.write(data)
+        #LOGDBG.debug('pos: %d', self._filepos(tmpfh))
         tmpfh.write(end)
         LOGDBG.debug('pos: %d', self._filepos(tmpfh))
-        tmpfh.flush()
+        #tmpfh.flush()
 
+        '''
         if hasattr(tmpfh, 'getvalue'):  # StringIO
             fh2 = open(newfile, 'wb')
             fh2.truncate()
@@ -699,6 +702,7 @@ class IPTCInfo:
             elif os.path.exists(newfile):
                 shutil.move(newfile, "{file}~".format(file=newfile))
             shutil.move(tmpfn, newfile)
+        '''
         return True
 
     def __del__(self):
@@ -846,12 +850,23 @@ class IPTCInfo:
                 return None
 
             (tag, record, dataset, length) = unpack("!BBBH", header)
+
+            # If highest significant bit of length is set, we have an "Extended DataSet Tag"
+            # see page 13 of http://www.iptc.org/std/IIM/3.0/specification/IIMV3.PDF
+            if length > 32768:
+                length_of_length_field = length - 32768
+                length_field = read_exactly(fh, length_of_length_field)
+                # Pad with zeros so we can unpack as unsigned long long
+                # We don't expect length field to be bigger than 8 bytes :P
+                length_field = b"\x00" * (8 - length_of_length_field) + length_field
+                length, = unpack("!Q", length_field)
+
             # bail if we're past end of IIM record 2 data
             if not (tag == 0x1c and record == 2):
                 return None
 
             alist = {'tag': tag, 'record': record, 'dataset': dataset, 'length': length}
-            logger.debug('\t'.join('%s: %s' % (k, v) for k, v in alist.items()))
+            #logger.debug('\t'.join('%s: %s' % (k, v) for k, v in alist.items()))
             value = fh.read(length)
 
             if self.inp_charset:
@@ -913,7 +928,15 @@ class IPTCInfo:
             value = self._enc(value)
             if not isinstance(value, list):
                 value = bytes(value)
-                out.append(pack("!BBBH", tag, record, dataset, len(value)))
+                length = len(value)
+                if length < 0x8000:
+                    out.append(pack("!BBBH", tag, record, dataset, length))
+                elif length < 0x100000000:
+                    # create "Extended DataSet Tag"
+                    # http://www.iptc.org/std/IIM/3.0/specification/IIMV3.PDF
+                    out.append(pack("!BBBHI", tag, record, dataset, 0x8000 + 4, length))
+                else:
+                    raise ValueError('data too long')
                 out.append(value)
             else:
                 for v in map(bytes, value):
@@ -938,21 +961,26 @@ class IPTCInfo:
         # 0x0404 is IIM data, 00 is required empty string
         resourceBlock.append(pack("BBBB", 0x04, 0x04, 0, 0))
         # length of data as 32-bit, network-byte order
+        extra_byte = int(len(data) % 2 != 0)
+        #extra_byte = 0
         resourceBlock.append(pack("!L", len(data)))
         # Now tack data on there
         resourceBlock.append(data)
         # Pad with a blank if not even size
-        if len(data) % 2 != 0:
+        if extra_byte:
             resourceBlock.append(pack("B", 0))
         # Finally tack on other data
-        if otherparts is not None:
+        if otherparts:
             resourceBlock.append(otherparts)
         resourceBlock = b''.join(resourceBlock)
 
         out.append(pack("BB", 0xff, 0xed))  # Jpeg start of block, APP13
-        out.append(pack("!H", len(resourceBlock) + 2))  # length
+        pack_length = len(resourceBlock) + 2
+        #if pack_length > 0xffff:
+        # yes this is how it's done 
+        #    pack_length = 0xffff
+        out.append(pack("!H", pack_length))  # length
         out.append(resourceBlock)
-
         return b''.join(out)
 
 
